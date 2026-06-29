@@ -1,0 +1,11 @@
+# Environment — never commit
+.env
+.env.*
+
+# Build artifacts — key is baked in by Vite, never commit
+dist/
+dist-electron/
+release/
+
+# Dependencies
+node_modules/
