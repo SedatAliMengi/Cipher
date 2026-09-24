@@ -3,8 +3,20 @@ import path from 'path'
 import fs from 'fs'
 import pdfParse from 'pdf-parse'
 import mammoth from 'mammoth'
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import JSZip from 'jszip'
+import { aiDataFiles, generateAiData, type AiDataResult } from './aiData'
+import { askForJson, createClient, describeClaudeError } from './claude'
+import { combineDatasets, combinedFiles, type CombinedResult } from './combine'
+
+// Electron doesn't read .env by itself. A packaged app has no .env, so a missing file is fine.
+try {
+  process.loadEnvFile(path.join(app.getAppPath(), '.env'))
+} catch {
+  // no .env file
+}
+
+// Used by every output mode. Claude Haiku 4.5 is the cheapest Claude model; set CLAUDE_MODEL in .env to use another.
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5'
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -45,27 +57,35 @@ ipcMain.handle('extract-text', async (_event, filePath: string) => {
   }
 })
 
-ipcMain.handle(
-  'call-gemini',
-  async (_event, text: string, outputType: string) => {
-    const apiKey = process.env.VITE_GEMINI_API_KEY
-    if (!apiKey) throw new Error('Gemini API key not set — add VITE_GEMINI_API_KEY to .env')
-    const genAI = new GoogleGenerativeAI(apiKey)
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
-
-    const prompt = buildPrompt(outputType, text)
-    const result = await model.generateContent(prompt)
-    const responseText: string = result.response.text()
-
-    const cleaned = responseText
-      .replace(/^```json\s*/m, '')
-      .replace(/^```\s*/m, '')
-      .replace(/\s*```$/m, '')
-      .trim()
-
-    return JSON.parse(cleaned) as Record<string, unknown>
+ipcMain.handle('call-claude', async (_event, text: string, outputType: string) => {
+  try {
+    const client = createClient(getApiKey())
+    return (await askForJson(client, CLAUDE_MODEL, buildPrompt(outputType, text))) as Record<string, unknown>
+  } catch (err) {
+    throw new Error(describeClaudeError(err))
   }
-)
+})
+
+ipcMain.handle('generate-ai-data', async (event, text: string, source: string) => {
+  try {
+    const input = { apiKey: getApiKey(), model: CLAUDE_MODEL, source, text }
+    return await generateAiData(input, (done, total) => {
+      if (!event.sender.isDestroyed()) event.sender.send('ai-data-progress', { done, total })
+    })
+  } catch (err) {
+    throw new Error(describeClaudeError(err))
+  }
+})
+
+ipcMain.handle('pick-datasets', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog({
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Cipher datasets', extensions: ['zip'] }],
+  })
+  return canceled ? [] : filePaths
+})
+
+ipcMain.handle('combine-datasets', (_event, filePaths: string[]) => combineDatasets(filePaths))
 
 ipcMain.handle(
   'save-zip',
@@ -77,21 +97,37 @@ ipcMain.handle(
 
     if (canceled || !filePath) return { success: false }
 
-    const trainingEntry = {
-      instruction: trainingInstruction(outputType),
-      input: sourceText,
-      output: JSON.stringify(jsonData),
-    }
+    const files =
+      outputType === 'ai-data' ? aiDataFiles(jsonData as AiDataResult)
+      : outputType === 'combined' ? combinedFiles(jsonData as CombinedResult)
+      : documentFiles(jsonData, sourceText, outputType)
 
     const zip = new JSZip()
-    zip.file('output.json', JSON.stringify(jsonData, null, 2))
-    zip.file('training.jsonl', JSON.stringify(trainingEntry))
+    for (const [name, content] of Object.entries(files)) zip.file(name, content)
     const buffer = await zip.generateAsync({ type: 'nodebuffer' })
     fs.writeFileSync(filePath, buffer)
 
     return { success: true, filePath }
   }
 )
+
+function documentFiles(jsonData: Record<string, unknown>, sourceText: string, outputType: string): Record<string, string> {
+  const trainingEntry = {
+    instruction: trainingInstruction(outputType),
+    input: sourceText,
+    output: JSON.stringify(jsonData),
+  }
+  return {
+    'output.json': JSON.stringify(jsonData, null, 2),
+    'training.jsonl': JSON.stringify(trainingEntry),
+  }
+}
+
+function getApiKey(): string {
+  const apiKey = process.env.CLAUDE_API_KEY
+  if (!apiKey) throw new Error('Claude API key not set — add CLAUDE_API_KEY to .env')
+  return apiKey
+}
 
 function trainingInstruction(outputType: string): string {
   if (outputType === 'knowledge-base')

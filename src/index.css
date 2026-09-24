@@ -4,6 +4,11 @@
   padding: 0;
 }
 
+/* Author display rules (like .main's flex) would otherwise override the hidden attribute */
+[hidden] {
+  display: none !important;
+}
+
 body {
   background: #0d0d0d;
   color: #dedede;
@@ -33,6 +38,36 @@ body {
   font-size: 18px;
   font-weight: 700;
   letter-spacing: 4px;
+  color: #fff;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  background: #111;
+  border: 1px solid #1e1e1e;
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  color: #666;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  transition: background 0.15s, color 0.15s;
+}
+
+.tab:hover {
+  color: #aaa;
+}
+
+.tab.active {
+  background: #1e1e1e;
   color: #fff;
 }
 
@@ -163,6 +198,7 @@ body {
 
 .output-type-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -210,6 +246,43 @@ body {
   cursor: not-allowed;
 }
 
+/* Progress */
+.progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.progress-bar {
+  height: 4px;
+  background: #1e1e1e;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #6c63ff;
+  transition: width 0.3s;
+}
+
+.progress-label {
+  font-size: 12px;
+  color: #777;
+}
+
+/* Warning */
+.warning-box {
+  background: #1e1a0a;
+  border: 1px solid #5a4a1a;
+  color: #e0b050;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 /* Error */
 .error-box {
   background: #1e0f0f;
@@ -219,6 +292,7 @@ body {
   border-radius: 8px;
   font-size: 13px;
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 /* Result */
@@ -406,6 +480,123 @@ body {
   line-height: 1.6;
   background: #0d1a0d;
   border-top: 1px solid #1e1e1e;
+}
+
+/* AI Data */
+.aidata-stats {
+  display: flex;
+  gap: 12px;
+}
+
+.aidata-stat {
+  flex: 1;
+  background: #111;
+  border: 1px solid #1e1e1e;
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.aidata-stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.aidata-stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: #555;
+}
+
+.aidata-note {
+  font-size: 12px;
+  color: #666;
+  line-height: 1.6;
+}
+
+.pair-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pair-item {
+  border: 1px solid #1e1e1e;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pair-instruction {
+  background: #111;
+  padding: 12px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #dedede;
+  line-height: 1.5;
+}
+
+.pair-output {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: #98d99e;
+  line-height: 1.6;
+  background: #0d1a0d;
+  border-top: 1px solid #1e1e1e;
+}
+
+.pair-more {
+  font-size: 12px;
+  color: #555;
+}
+
+/* Combine datasets */
+.combine-hint {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.dataset-list,
+.source-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dataset-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #111;
+  border: 1px solid #1e1e1e;
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.combine-count {
+  font-size: 12px;
+  color: #666;
+}
+
+.source-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: #ccc;
+}
+
+.source-count {
+  color: #666;
+  flex-shrink: 0;
 }
 
 .json-viewer {
