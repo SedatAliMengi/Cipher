@@ -1,6 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk'
 
 export type JsonSchema = { [key: string]: unknown }
+// Plain text, or blocks that can mix text with PDFs and images
+export type Content = string | Anthropic.ContentBlockParam[]
 
 // A busy Claude can hold a request open for a long time; give up after 2 minutes (the SDK then retries it)
 export const REQUEST_TIMEOUT_MS = 120_000
@@ -16,9 +18,9 @@ export function createClient(apiKey: string): Anthropic {
 }
 
 // Sends one prompt and returns the parsed JSON reply. With a schema, Claude is forced to match it exactly.
-export async function askForJson(client: Anthropic, model: string, prompt: string, schema?: JsonSchema): Promise<unknown> {
+export async function askForJson(client: Anthropic, model: string, content: Content, schema?: JsonSchema): Promise<unknown> {
   for (let attempt = 1; ; attempt++) {
-    const text = await ask(client, model, prompt, schema)
+    const text = await ask(client, model, content, schema)
     try {
       return JSON.parse(stripCodeFences(text))
     } catch {
@@ -27,11 +29,15 @@ export async function askForJson(client: Anthropic, model: string, prompt: strin
   }
 }
 
-async function ask(client: Anthropic, model: string, prompt: string, schema?: JsonSchema): Promise<string> {
+export async function askForText(client: Anthropic, model: string, content: Content): Promise<string> {
+  return ask(client, model, content)
+}
+
+async function ask(client: Anthropic, model: string, content: Content, schema?: JsonSchema): Promise<string> {
   const response = await client.messages.create({
     model,
     max_tokens: 16000,
-    messages: [{ role: 'user', content: prompt }],
+    messages: [{ role: 'user', content }],
     ...(schema && { output_config: { format: { type: 'json_schema' as const, schema } } }),
   })
   if (response.stop_reason === 'refusal') throw new RefusalError('Claude declined to process this text.')
@@ -54,6 +60,14 @@ function stripCodeFences(text: string): string {
 // Errors that would fail every remaining request the same way (bad key, no credit, limit reached, no internet)
 export function isRequestLevelError(err: unknown): boolean {
   return err instanceof Anthropic.APIError && (err.status === undefined || err.status < 500)
+}
+
+// The narrower set no other file would get past either: bad key, no credit, spend or rate limit, unknown model, no internet.
+// Any other bad request (an image Claude can't read, say) only concerns the file that caused it.
+export function isAccountLevelError(err: unknown): boolean {
+  if (!(err instanceof Anthropic.APIError)) return false
+  if (err.status === undefined || [401, 402, 403, 404, 429].includes(err.status)) return true
+  return err.status === 400 && /credit balance|billing|usage limit|spend limit/i.test(err.message)
 }
 
 // Turns API errors into one readable sentence for the UI

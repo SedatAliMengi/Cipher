@@ -1,12 +1,15 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import path from 'path'
 import fs from 'fs'
-import pdfParse from 'pdf-parse'
-import mammoth from 'mammoth'
+import type Anthropic from '@anthropic-ai/sdk'
 import JSZip from 'jszip'
 import { aiDataFiles, generateAiData, type AiDataResult } from './aiData'
-import { askForJson, createClient, describeClaudeError } from './claude'
-import { combineDatasets, combinedFiles, type CombinedResult } from './combine'
+import { askForJson, createClient, describeClaudeError, isAccountLevelError } from './claude'
+import { combineDatasets, combinedFiles, combineResults, type CombinedResult } from './combine'
+import { extractSource, listSupportedFiles, type Extracted } from './extract'
+import { isSupported, SUPPORTED_EXTENSIONS } from './fileTypes'
+import { StoppedError, type Hooks } from './jobs'
+import type { BatchItem, BatchResult, ExpandedPaths, ProcessOptions, ProcessResult, SourceRef } from './types'
 
 // Electron doesn't read .env by itself. A packaged app has no .env, so a missing file is fine.
 try {
@@ -42,40 +45,118 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-ipcMain.handle('extract-text', async (_event, filePath: string) => {
-  const ext = path.extname(filePath).toLowerCase()
+let stopRequested = false
 
-  if (ext === '.pdf') {
-    const buffer = fs.readFileSync(filePath)
-    const data = await pdfParse(buffer)
-    return data.text as string
-  } else if (ext === '.docx') {
-    const result = await mammoth.extractRawText({ path: filePath })
-    return result.value as string
-  } else {
-    throw new Error(`Unsupported file type: ${ext}`)
-  }
+ipcMain.handle('pick-sources', async (_event, kind: 'files' | 'folder') => {
+  const { canceled, filePaths } = await dialog.showOpenDialog(
+    kind === 'folder'
+      ? { properties: ['openDirectory'] }
+      : { properties: ['openFile', 'multiSelections'], filters: [{ name: 'Documents and images', extensions: SUPPORTED_EXTENSIONS.map((e) => e.slice(1)) }] }
+  )
+  return canceled ? { files: [], unsupported: [], truncated: [] } : expandPaths(filePaths)
 })
 
-ipcMain.handle('call-claude', async (_event, text: string, outputType: string) => {
+// Dropped or chosen paths -> readable files; folders are searched, anything else unreadable is reported by name
+ipcMain.handle('expand-paths', (_event, paths: string[]) => expandPaths(paths))
+
+async function expandPaths(paths: string[]): Promise<ExpandedPaths> {
+  const files: string[] = []
+  const unsupported: string[] = []
+  const truncated: string[] = []
+  for (const p of paths) {
+    const stat = await fs.promises.stat(p).catch(() => null)
+    if (stat?.isDirectory()) {
+      const listed = await listSupportedFiles(p)
+      files.push(...listed.files)
+      if (listed.truncated) truncated.push(path.basename(p))
+    } else if (stat?.isFile() && isSupported(p)) files.push(p)
+    else unsupported.push(path.basename(p))
+  }
+  return { files, unsupported, truncated }
+}
+
+ipcMain.handle('stop', () => {
+  stopRequested = true
+})
+
+ipcMain.handle('process', async (event, sources: SourceRef[], outputType: string, options: ProcessOptions): Promise<ProcessResult> => {
+  stopRequested = false
+  const hooks: Hooks = {
+    onProgress: (label, done, total) => {
+      if (!event.sender.isDestroyed()) event.sender.send('progress', { label, done, total })
+    },
+    shouldStop: () => stopRequested,
+  }
   try {
     const client = createClient(getApiKey())
-    return (await askForJson(client, CLAUDE_MODEL, buildPrompt(outputType, text))) as Record<string, unknown>
+    return sources.length === 1
+      ? await processOne(client, sources[0], outputType, options, hooks)
+      : await processMany(client, sources, outputType, options, hooks)
   } catch (err) {
     throw new Error(describeClaudeError(err))
   }
 })
 
-ipcMain.handle('generate-ai-data', async (event, text: string, source: string) => {
-  try {
-    const input = { apiKey: getApiKey(), model: CLAUDE_MODEL, source, text }
-    return await generateAiData(input, (done, total) => {
-      if (!event.sender.isDestroyed()) event.sender.send('ai-data-progress', { done, total })
-    })
-  } catch (err) {
-    throw new Error(describeClaudeError(err))
+async function processOne(client: Anthropic, source: SourceRef, outputType: string, options: ProcessOptions, hooks: Hooks): Promise<ProcessResult> {
+  const { text, method } = await readSource(client, source, options, hooks)
+  const data =
+    outputType === 'ai-data'
+      ? await generateAiData({ client, model: CLAUDE_MODEL, source: source.name, text, options }, hooks)
+      : await runMode(client, outputType, text, hooks)
+  return { type: outputType, data, filename: `${baseName(source.name)}_${outputType}.zip`, sourceText: text, note: `Read as: ${method}` }
+}
+
+async function processMany(client: Anthropic, sources: SourceRef[], outputType: string, options: ProcessOptions, hooks: Hooks): Promise<ProcessResult> {
+  const results: AiDataResult[] = []
+  const items: BatchItem[] = []
+  const failures: { file: string; reason: string }[] = []
+
+  for (const [i, source] of sources.entries()) {
+    if (stopRequested) break
+    const fileHooks: Hooks = {
+      ...hooks,
+      onProgress: (label, done, total) => hooks.onProgress(`File ${i + 1} of ${sources.length} · ${source.name} — ${label}`, done, total),
+    }
+    try {
+      const { text, method } = await readSource(client, source, options, fileHooks)
+      if (outputType === 'ai-data') {
+        results.push(await generateAiData({ client, model: CLAUDE_MODEL, source: source.name, text, options }, fileHooks))
+      } else {
+        items.push({ name: source.name, method, text, data: await runMode(client, outputType, text, fileHooks) })
+      }
+    } catch (err) {
+      if (err instanceof StoppedError) break
+      failures.push({ file: source.name, reason: describeClaudeError(err) })
+      // A bad key or an empty balance would fail every remaining file the same way
+      if (isAccountLevelError(err)) break
+    }
   }
-})
+
+  const done = results.length + items.length
+  const notReached = sources.slice(done + failures.length)
+  const why = stopRequested ? 'not processed: stopped early' : 'not processed: skipped after an account or connection error'
+  failures.push(...notReached.map((s) => ({ file: s.name, reason: why })))
+  if (done === 0) throw new Error(failures[0] ? `No file could be processed. ${failures[0].file}: ${failures[0].reason}` : 'Nothing was processed.')
+
+  if (outputType === 'ai-data') {
+    return { type: 'combined', data: combineResults(results, failures), filename: 'batch_ai-data.zip', sourceText: '' }
+  }
+  const batch: BatchResult = { mode: outputType, items, failures }
+  return { type: 'batch', data: batch, filename: `batch_${outputType}.zip`, sourceText: '' }
+}
+
+async function readSource(client: Anthropic, source: SourceRef, options: ProcessOptions, hooks: Hooks): Promise<Extracted> {
+  const extracted = await extractSource(source, { ...hooks, client, model: CLAUDE_MODEL, readVisuals: options.readVisuals })
+  if (!extracted.text.trim()) throw new Error(`No text could be found in ${source.name}.`)
+  return extracted
+}
+
+async function runMode(client: Anthropic, outputType: string, text: string, hooks: Hooks): Promise<Record<string, unknown>> {
+  hooks.onProgress('Asking Claude…', 0, 1)
+  const data = (await askForJson(client, CLAUDE_MODEL, buildPrompt(outputType, text))) as Record<string, unknown>
+  hooks.onProgress('Asking Claude…', 1, 1)
+  return data
+}
 
 ipcMain.handle('pick-datasets', async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog({
@@ -100,6 +181,7 @@ ipcMain.handle(
     const files =
       outputType === 'ai-data' ? aiDataFiles(jsonData as AiDataResult)
       : outputType === 'combined' ? combinedFiles(jsonData as CombinedResult)
+      : outputType === 'batch' ? batchFiles(jsonData as BatchResult)
       : documentFiles(jsonData, sourceText, outputType)
 
     const zip = new JSZip()
@@ -121,6 +203,31 @@ function documentFiles(jsonData: Record<string, unknown>, sourceText: string, ou
     'output.json': JSON.stringify(jsonData, null, 2),
     'training.jsonl': JSON.stringify(trainingEntry),
   }
+}
+
+// A folder per processed file with its output.json and training.jsonl, plus a summary of what was processed
+function batchFiles({ mode, items, failures }: BatchResult): Record<string, string> {
+  const files: Record<string, string> = {}
+  const used = new Set<string>()
+  for (const item of items) {
+    // Files with the same name (from different folders) each get their own folder
+    let folder = baseName(item.name)
+    for (let n = 2; used.has(folder); n++) folder = `${baseName(item.name)} (${n})`
+    used.add(folder)
+    for (const [name, content] of Object.entries(documentFiles(item.data, item.text, mode))) files[`${folder}/${name}`] = content
+  }
+  files['batch_summary.json'] = JSON.stringify(
+    { mode, processed: items.map((i) => ({ file: i.name, read_as: i.method })), failed: failures },
+    null,
+    2
+  )
+  return files
+}
+
+// A short, file-system-safe name for output files: "report.pdf" -> "report", "https://site.com/a/b" -> "site.com_a_b"
+function baseName(name: string): string {
+  const readable = /^https?:\/\//i.test(name) ? name.replace(/^https?:\/\//i, '').replace(/\/+$/, '') : name.replace(/\.[a-z0-9]{2,5}$/i, '')
+  return readable.replace(/[^\p{L}\p{N}._-]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'document'
 }
 
 function getApiKey(): string {
