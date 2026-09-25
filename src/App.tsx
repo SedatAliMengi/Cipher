@@ -1,10 +1,11 @@
-import { useState, useCallback } from 'react'
+import { useState } from 'react'
 import type { AiDataResult } from '../electron/aiData'
 import type { CombinedResult } from '../electron/combine'
+import { MAX_FOLDER_FILES } from '../electron/fileTypes'
+import type { BatchResult, ExpandedPaths, ProcessOptions, ProcessResult, Progress, SourceRef } from '../electron/types'
 
 type DroppedFile = { name: string; path: string }
-type Result = { type: string; data: Record<string, unknown>; filename: string; sourceText: string }
-type Progress = { done: number; total: number }
+type Result = ProcessResult
 type View = 'documents' | 'combine'
 
 const OUTPUT_TYPES = [
@@ -88,33 +89,53 @@ function StatCards({ stats }: { stats: { label: string; value: number }[] }) {
   )
 }
 
+// "3 x, 1 y and 2 z" from the non-zero counts
+function countList(parts: [number, string][]): string {
+  const items = parts.filter(([n]) => n > 0).map(([n, text]) => `${n.toLocaleString()} ${text}`)
+  return items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}` : items.join('')
+}
+
 function AiDataView({ data }: { data: AiDataResult }) {
+  const { stats } = data
   const preview = data.pairs.slice(0, PREVIEW_PAIRS)
+  const removed = countList([
+    [stats.dropped.unverified, `pair${stats.dropped.unverified === 1 ? '' : 's'} whose quote wasn't in the document`],
+    [stats.dropped.review, `pair${stats.dropped.review === 1 ? '' : 's'} that failed the double-check`],
+    [stats.dropped.duplicates, `duplicate${stats.dropped.duplicates === 1 ? '' : 's'}`],
+  ])
 
   return (
     <div className="summary-doc">
       <StatCards
         stats={[
-          { label: 'Chunks', value: data.stats.chunks },
-          { label: 'Training pairs', value: data.stats.pairs },
-          { label: 'Tokens (approx.)', value: data.stats.approx_dataset_tokens },
+          { label: 'Training pairs', value: stats.pairs },
+          { label: 'Training rows', value: stats.rows.training },
+          { label: 'Chunks', value: stats.chunks },
+          { label: 'Tokens (approx.)', value: stats.approx_dataset_tokens },
         ]}
       />
 
       {data.warning && <div className="warning-box">{data.warning}</div>}
 
       <p className="aidata-note">
-        The ZIP contains alpaca.jsonl and chat.jsonl (the same pairs in two training formats),
-        chunks.jsonl (the raw text chunks) and stats.json.
+        Every pair's quote was found word for word in the document{stats.options.review ? ' and the pair passed a second check' : ''}.
+        {removed && ` Removed: ${removed}.`}
+      </p>
+      <p className="aidata-note">
+        The ZIP has pairs.jsonl (everything), alpaca.jsonl and chat.jsonl (one row per phrasing)
+        {stats.options.extras ? ', preferences.jsonl and conversations.jsonl' : ''}, chunks.jsonl (search-ready text),
+        stats.json and a README.md dataset card for Hugging Face.
       </p>
 
       <section className="summary-section">
         <h3 className="section-heading">Preview</h3>
         <div className="pair-list">
-          {preview.map((p, i) => (
-            <div key={i} className="pair-item">
+          {preview.map((p) => (
+            <div key={p.id} className="pair-item">
               <p className="pair-instruction">{p.instruction}</p>
               <p className="pair-output">{p.output}</p>
+              {p.quote && <p className="pair-quote">“{p.quote}”</p>}
+              {p.variants.length > 0 && <p className="pair-variants">Also asked as: {p.variants.join(' · ')}</p>}
             </div>
           ))}
         </div>
@@ -128,28 +149,30 @@ function AiDataView({ data }: { data: AiDataResult }) {
 
 function CombinedView({ data }: { data: CombinedResult }) {
   const { stats } = data
+  const notes = [...stats.skipped_files.map((f) => `Skipped ${f.file}: ${f.reason}`), ...stats.partial_files.map((f) => `${f.file}: ${f.reason}`)]
+  const extraFolders = [stats.rows.preferences > 0 && 'preferences/', stats.rows.conversations > 0 && 'conversations/'].filter(Boolean)
 
   return (
     <div className="summary-doc">
       <StatCards
         stats={[
           { label: 'Training pairs', value: stats.pairs },
+          { label: 'Training rows', value: stats.rows.training },
           { label: 'Duplicates removed', value: stats.duplicates_removed },
           { label: 'Tokens (approx.)', value: stats.approx_tokens },
         ]}
       />
 
-      {stats.skipped_files.length > 0 && (
+      {notes.length > 0 && (
         <div className="warning-box">
-          Skipped {stats.skipped_files.length === 1 ? '1 file' : `${stats.skipped_files.length} files`}:{' '}
-          {stats.skipped_files.map((f) => `${f.file} (${f.reason})`).join('; ')}
+          {notes.map((note, i) => <p key={i}>{note}</p>)}
         </div>
       )}
 
       <p className="aidata-note">
         {stats.train.toLocaleString()} pairs for training and {stats.validation.toLocaleString()} set aside for
-        validation. The ZIP has alpaca/ and chat/ folders, each with train.jsonl and validation.jsonl, plus
-        chunks.jsonl and stats.json.
+        validation. The ZIP has alpaca/, chat/{extraFolders.map((f) => `, ${f}`).join('')} folders with train.jsonl and
+        validation.jsonl, plus pairs.jsonl, chunks.jsonl, stats.json and a README.md dataset card.
       </p>
 
       <section className="summary-section">
@@ -159,6 +182,41 @@ function CombinedView({ data }: { data: CombinedResult }) {
             <li key={s.source} className="source-item">
               <span>{s.source}</span>
               <span className="source-count">{s.pairs.toLocaleString()} pairs</span>
+            </li>
+          ))}
+        </ul>
+      </section>
+    </div>
+  )
+}
+
+function BatchView({ data }: { data: BatchResult }) {
+  return (
+    <div className="summary-doc">
+      <StatCards
+        stats={[
+          { label: 'Files processed', value: data.items.length },
+          { label: 'Files not processed', value: data.failures.length },
+        ]}
+      />
+
+      {data.failures.length > 0 && (
+        <div className="warning-box">
+          {data.failures.map((f, i) => <p key={i}>{f.file}: {f.reason}</p>)}
+        </div>
+      )}
+
+      <p className="aidata-note">
+        The ZIP has a folder for each file with its output.json and training.jsonl, plus batch_summary.json.
+      </p>
+
+      <section className="summary-section">
+        <h3 className="section-heading">Files</h3>
+        <ul className="source-list">
+          {data.items.map((item, i) => (
+            <li key={i} className="source-item">
+              <span>{item.name}</span>
+              <span className="source-count">{item.method}</span>
             </li>
           ))}
         </ul>
@@ -178,15 +236,30 @@ function ResultSection({ result }: { result: Result }) {
           &#8595; Download ZIP
         </button>
       </div>
+      {result.note && <p className="result-note">{result.note}</p>}
       {result.type === 'student-summary' ? (
         <StudentSummaryView data={result.data as StudentSummary} />
       ) : result.type === 'ai-data' ? (
         <AiDataView data={result.data as AiDataResult} />
       ) : result.type === 'combined' ? (
         <CombinedView data={result.data as CombinedResult} />
+      ) : result.type === 'batch' ? (
+        <BatchView data={result.data as BatchResult} />
       ) : (
         <pre className="json-viewer">{JSON.stringify(result.data, null, 2)}</pre>
       )}
+    </div>
+  )
+}
+
+function ProgressBar({ progress }: { progress: Progress }) {
+  const percent = progress.total ? (progress.done / progress.total) * 100 : 0
+  return (
+    <div className="progress">
+      <div className="progress-bar">
+        <div className="progress-fill" style={{ width: `${percent}%` }} />
+      </div>
+      <span className="progress-label">{progress.label}</span>
     </div>
   )
 }
@@ -196,96 +269,139 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : 'Something went wrong.'
 }
 
+const fileName = (filePath: string) => filePath.split(/[\\/]/).pop() ?? filePath
+
 function DocumentsPanel() {
-  const [file, setFile] = useState<DroppedFile | null>(null)
+  const [sources, setSources] = useState<SourceRef[]>([])
+  const [link, setLink] = useState('')
   const [isDragOver, setIsDragOver] = useState(false)
   const [outputType, setOutputType] = useState('knowledge-base')
+  const [options, setOptions] = useState<ProcessOptions>({ review: true, extras: true, readVisuals: false })
   const [isProcessing, setIsProcessing] = useState(false)
-  const [result, setResult] = useState<Result | null>(null)
   const [progress, setProgress] = useState<Progress | null>(null)
+  const [result, setResult] = useState<Result | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const handleDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault()
-    setIsDragOver(false)
-
-    const dropped = e.dataTransfer.files[0]
-    if (!dropped) return
-
-    const ext = dropped.name.split('.').pop()?.toLowerCase()
-    if (ext === 'zip') {
-      setError('ZIP datasets go in the Combine datasets tab.')
-      return
-    }
-    if (ext !== 'pdf' && ext !== 'docx') {
-      setError('Only PDF and DOCX files are supported.')
-      return
-    }
-
-    const filePath = window.cipher.getFilePath(dropped)
-    setFile({ name: dropped.name, path: filePath })
+  const addSources = (fresh: SourceRef[]) => {
+    const key = (s: SourceRef) => (s.kind === 'file' ? s.path : s.url)
+    setSources((current) => [...current, ...fresh.filter((f) => !current.some((c) => key(c) === key(f)))])
     setResult(null)
     setError(null)
-  }, [])
+  }
 
-  const generateAiData = async (text: string, source: string) => {
-    const unsubscribe = window.cipher.onAiDataProgress(setProgress)
-    try {
-      return await window.cipher.generateAiData(text, source)
-    } finally {
-      unsubscribe()
-      setProgress(null)
+  // Folders are searched for readable files; anything unreadable is named in an error
+  const addPaths = ({ files, unsupported, truncated }: ExpandedPaths) => {
+    addSources(files.map((p) => ({ kind: 'file', path: p, name: fileName(p) })))
+    const problems: string[] = []
+    if (truncated.length) {
+      problems.push(`Only ${MAX_FOLDER_FILES} files were added from ${truncated.join(', ')}, the most Cipher takes from one folder.`)
     }
+    if (unsupported.length && unsupported.every((name) => name.toLowerCase().endsWith('.zip'))) {
+      problems.push('ZIP datasets go in the Combine datasets tab.')
+    } else if (unsupported.length) {
+      problems.push(`Can't read ${unsupported.join(', ')}. Cipher reads PDF, Word, PowerPoint, Excel, EPUB, text, Markdown, CSV, HTML and images.`)
+    }
+    if (problems.length) setError(problems.join(' '))
+  }
+
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    setIsDragOver(false)
+    const paths = [...e.dataTransfer.files].map((f) => window.cipher.getFilePath(f))
+    if (paths.length) addPaths(await window.cipher.expandPaths(paths))
+  }
+
+  const handleChoose = async (kind: 'files' | 'folder') => addPaths(await window.cipher.pickSources(kind))
+
+  const addLink = () => {
+    const url = link.trim()
+    if (!url) return
+    if (!/^https?:\/\/\S+$/i.test(url)) {
+      setError('Links need to start with http:// or https://')
+      return
+    }
+    addSources([{ kind: 'url', url, name: url }])
+    setLink('')
+  }
+
+  const removeSource = (source: SourceRef) => {
+    setSources((current) => current.filter((s) => s !== source))
+    setResult(null)
+  }
+
+  const removeAll = () => {
+    setSources([])
+    setResult(null)
+    setError(null)
   }
 
   const handleProcess = async () => {
-    if (!file) return
+    if (!sources.length) return
     setIsProcessing(true)
     setError(null)
     setResult(null)
-
+    const unsubscribe = window.cipher.onProgress(setProgress)
     try {
-      const text = await window.cipher.extractText(file.path)
-      if (!text || text.trim().length === 0) {
-        throw new Error('No text could be extracted from the file.')
-      }
-      const data = outputType === 'ai-data'
-        ? await generateAiData(text, file.name)
-        : await window.cipher.callClaude(text, outputType)
-      const base = file.name.replace(/\.(pdf|docx)$/i, '')
-      setResult({ type: outputType, data, filename: `${base}_${outputType}.zip`, sourceText: text })
+      setResult(await window.cipher.process(sources, outputType, options))
     } catch (err) {
       setError(errorMessage(err))
     } finally {
+      unsubscribe()
+      setProgress(null)
       setIsProcessing(false)
     }
   }
 
-  const canProcess = !!file && !isProcessing
+  const setOption = (name: keyof ProcessOptions) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setOptions((current) => ({ ...current, [name]: e.target.checked }))
 
   return (
     <>
       <div
-        className={`drop-zone${isDragOver ? ' drag-over' : ''}${file ? ' has-file' : ''}`}
+        className={`drop-zone${isDragOver ? ' drag-over' : ''}${sources.length ? ' has-file' : ''}`}
         onDrop={handleDrop}
         onDragOver={(e) => { e.preventDefault(); setIsDragOver(true) }}
         onDragLeave={() => setIsDragOver(false)}
       >
-        {file ? (
-          <div className="file-info">
-            <span className="file-icon">&#128196;</span>
-            <span className="file-name">{file.name}</span>
-            <button
-              className="btn-clear"
-              onClick={() => { setFile(null); setResult(null); setError(null) }}
-            >
-              &#x2715;
-            </button>
+        <div className="combine-hint">
+          <p className="drop-hint">Drop files or a folder here</p>
+          <p className="drop-types">PDF · Word · PowerPoint · Excel · EPUB · text · HTML · images</p>
+          <div className="button-row">
+            <button className="btn-ghost" onClick={() => handleChoose('files')}>Choose files</button>
+            <button className="btn-ghost" onClick={() => handleChoose('folder')}>Choose folder</button>
           </div>
-        ) : (
-          <p className="drop-hint">Drop a PDF or DOCX file here</p>
-        )}
+        </div>
       </div>
+
+      <div className="link-row">
+        <input
+          className="api-input link-input"
+          placeholder="…or paste a web page link"
+          value={link}
+          onChange={(e) => setLink(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') addLink() }}
+        />
+        <button className="btn-ghost" onClick={addLink} disabled={!link.trim()}>Add link</button>
+      </div>
+
+      {sources.length > 1 && (
+        <div className="list-header">
+          <span className="combine-count">{sources.length} files</span>
+          <button className="btn-ghost" onClick={removeAll} disabled={isProcessing}>Remove all</button>
+        </div>
+      )}
+      {sources.length > 0 && (
+        <ul className="dataset-list">
+          {sources.map((s) => (
+            <li key={s.kind === 'file' ? s.path : s.url} className="dataset-item">
+              <span className="file-name">{s.name}</span>
+              <button className="btn-clear" onClick={() => removeSource(s)} disabled={isProcessing}>
+                &#x2715;
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
 
       <div className="controls">
         <div className="output-type-row">
@@ -299,21 +415,36 @@ function DocumentsPanel() {
             </span>
           ))}
         </div>
-        <button className="btn-process" onClick={handleProcess} disabled={!canProcess}>
-          {isProcessing ? 'Processing…' : 'Process'}
-        </button>
+        <div className="process-buttons">
+          {isProcessing && (
+            <button className="btn-ghost" onClick={() => window.cipher.stop()}>Stop</button>
+          )}
+          <button className="btn-process" onClick={handleProcess} disabled={!sources.length || isProcessing}>
+            {isProcessing ? 'Processing…' : sources.length > 1 ? `Process ${sources.length} files` : 'Process'}
+          </button>
+        </div>
       </div>
 
-      {progress && (
-        <div className="progress">
-          <div className="progress-bar">
-            <div className="progress-fill" style={{ width: `${(progress.done / progress.total) * 100}%` }} />
-          </div>
-          <span className="progress-label">
-            Generating training data… {progress.done} of {progress.total} chunks done
-          </span>
-        </div>
-      )}
+      <div className="options-row">
+        {outputType === 'ai-data' && (
+          <>
+            <label className="option">
+              <input type="checkbox" checked={options.review} onChange={setOption('review')} />
+              Double-check every pair <span className="option-hint">(≈ +40% cost)</span>
+            </label>
+            <label className="option">
+              <input type="checkbox" checked={options.extras} onChange={setOption('extras')} />
+              Extra formats: reworded questions, wrong-answer pairs, conversations <span className="option-hint">(≈ +70% cost)</span>
+            </label>
+          </>
+        )}
+        <label className="option">
+          <input type="checkbox" checked={options.readVisuals} onChange={setOption('readVisuals')} />
+          Read images, charts and tables inside PDFs <span className="option-hint">(≈ $0.005 per page; scanned PDFs are always read this way)</span>
+        </label>
+      </div>
+
+      {progress && <ProgressBar progress={progress} />}
 
       {error && <div className="error-box">{error}</div>}
 
@@ -352,7 +483,7 @@ function CombinePanel() {
 
   const handleChoose = async () => {
     const paths = await window.cipher.pickDatasets()
-    addDatasets(paths.map((p) => ({ name: p.split(/[\\/]/).pop() ?? p, path: p })))
+    addDatasets(paths.map((p) => ({ name: fileName(p), path: p })))
   }
 
   const handleCombine = async () => {

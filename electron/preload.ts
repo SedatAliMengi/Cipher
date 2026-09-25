@@ -1,24 +1,26 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron'
-
-type AiDataProgress = { done: number; total: number }
+import type { ProcessOptions, Progress, SourceRef } from './types'
 
 contextBridge.exposeInMainWorld('cipher', {
   getFilePath: (file: File) => webUtils.getPathForFile(file),
 
-  extractText: (filePath: string) =>
-    ipcRenderer.invoke('extract-text', filePath),
+  pickSources: (kind: 'files' | 'folder') =>
+    ipcRenderer.invoke('pick-sources', kind),
 
-  callClaude: (text: string, outputType: string) =>
-    ipcRenderer.invoke('call-claude', text, outputType),
+  expandPaths: (paths: string[]) =>
+    ipcRenderer.invoke('expand-paths', paths),
 
-  generateAiData: (text: string, source: string) =>
-    ipcRenderer.invoke('generate-ai-data', text, source),
+  process: (sources: SourceRef[], outputType: string, options: ProcessOptions) =>
+    ipcRenderer.invoke('process', sources, outputType, options),
 
-  onAiDataProgress: (callback: (progress: AiDataProgress) => void) => {
-    const listener = (_event: IpcRendererEvent, progress: AiDataProgress) => callback(progress)
-    ipcRenderer.on('ai-data-progress', listener)
+  stop: () =>
+    ipcRenderer.invoke('stop'),
+
+  onProgress: (callback: (progress: Progress) => void) => {
+    const listener = (_event: IpcRendererEvent, progress: Progress) => callback(progress)
+    ipcRenderer.on('progress', listener)
     return () => {
-      ipcRenderer.removeListener('ai-data-progress', listener)
+      ipcRenderer.removeListener('progress', listener)
     }
   },
 

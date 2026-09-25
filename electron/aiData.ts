@@ -1,37 +1,56 @@
 import type Anthropic from '@anthropic-ai/sdk'
-import { askForJson, createClient, describeClaudeError, isRequestLevelError, type JsonSchema } from './claude'
+import { askForJson, describeClaudeError, isRequestLevelError, type JsonSchema } from './claude'
+import {
+  alpacaRows,
+  approxTokens,
+  chatRows,
+  conversationRows,
+  datasetCard,
+  datasetTokens,
+  jsonl,
+  normalizeText,
+  preferenceRows,
+  type Chunk,
+  type Conversation,
+  type DatasetConfig,
+  type Message,
+  type Pair,
+} from './formats'
+import { StoppedError, type Hooks } from './jobs'
 
-export type Chunk = { source: string; chunk: number; text: string; approx_tokens: number }
-export type TrainingPair = { instruction: string; output: string; source: string; chunk: number }
+export type AiDataOptions = { review: boolean; extras: boolean }
+export type Overview = { title: string; language: string; summary: string }
 export type AiDataStats = {
   source: string
+  title: string
+  language: string
   model: string
   created_at: string
+  options: AiDataOptions
   chunks: number
   pairs: number
+  rows: { training: number; preferences: number; conversations: number }
+  dropped: { unverified: number; review: number; duplicates: number }
   approx_source_tokens: number
   approx_dataset_tokens: number
   skipped_chunks: number[]
+  unreviewed_chunks: number
 }
 export type AiDataResult = {
+  overview: Overview
   chunks: Chunk[]
-  pairs: TrainingPair[]
+  pairs: Pair[]
+  conversations: Conversation[]
   stats: AiDataStats
   warning?: string
 }
-export type AiDataInput = { apiKey: string; model: string; source: string; text: string }
+export type AiDataInput = { client: Anthropic; model: string; source: string; text: string; options: AiDataOptions }
 
 const CHUNK_CHARS = 8000 // ≈ 2,000 tokens
 const CONCURRENCY = 3
-
-// Rough estimate (~4 characters per token in English); real counts vary by model and language
-export function approxTokens(text: string): number {
-  return Math.ceil(text.length / 4)
-}
-
-export function datasetTokens(pairs: TrainingPair[]): number {
-  return pairs.reduce((sum, p) => sum + approxTokens(p.instruction + p.output), 0)
-}
+// The start of a document is enough for its title, language and a summary
+const OVERVIEW_CHARS = 15000
+const MIN_REVIEW_SCORE = 3
 
 // Split at paragraph breaks, falling back to sentence breaks and then hard cuts for oversized pieces
 export function chunkText(text: string, maxChars = CHUNK_CHARS): string[] {
@@ -69,119 +88,367 @@ function pack(pieces: string[], maxChars: number, separator: string): string[] {
   return chunks
 }
 
-const PAIRS_SCHEMA: JsonSchema = {
+// A quote counts as found when each of its sentences appears word for word in the passage,
+// ignoring case, spacing, curly quotes, dashes, ligatures and words hyphenated across line breaks
+export function quoteFound(quote: string, passage: string): boolean {
+  const text = matchable(passage)
+  const parts = quote
+    .split(/\.\.\.|…|(?<=[.!?])\s+/)
+    .map((part) => matchable(part).replace(/^["'\s]+|["'\s.!?;:,]+$/g, ''))
+    .filter((part) => part.split(' ').length >= 3)
+  return parts.length > 0 && parts.every((part) => text.includes(part))
+}
+
+function matchable(text: string): string {
+  return text
+    .normalize('NFKC')
+    .replace(/[‐‑‒–—―]/g, '-')
+    .replace(/-\s*\n\s*/g, '')
+    .replace(/-/g, ' ')
+    .replace(/[‘’‚‛′]/g, "'")
+    .replace(/[“”„‟″]/g, '"')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim()
+}
+
+const OVERVIEW_SCHEMA: JsonSchema = {
   type: 'object',
   properties: {
-    pairs: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          instruction: { type: 'string' },
-          output: { type: 'string' },
-        },
-        required: ['instruction', 'output'],
-        additionalProperties: false,
-      },
-    },
+    title: { type: 'string' },
+    language: { type: 'string' },
+    summary: { type: 'string' },
   },
-  required: ['pairs'],
+  required: ['title', 'language', 'summary'],
   additionalProperties: false,
 }
 
-function pairsPrompt(passage: string): string {
-  return `You are building a fine-tuning dataset that teaches a language model the knowledge contained in a document. Below is one passage from that document.
+function overviewPrompt(text: string): string {
+  return `Below is the beginning of a document. Return:
+- title: the document's title, or a short descriptive title if it has none
+- language: the ISO 639-1 code of the document's main language, such as "en" or "tr"
+- summary: two sentences on what the whole document covers, written in the document's language
 
-Write up to 6 instruction-response pairs based ONLY on this passage:
+Document:
+${text.slice(0, OVERVIEW_CHARS)}`
+}
+
+function chunkSchema(extras: boolean): JsonSchema {
+  const pairProperties: Record<string, unknown> = {
+    instruction: { type: 'string' },
+    output: { type: 'string' },
+    quote: { type: 'string' },
+    ...(extras ? { variants: { type: 'array', items: { type: 'string' } }, rejected: { type: 'string' } } : {}),
+  }
+  const conversation = {
+    type: 'array',
+    items: {
+      type: 'object',
+      properties: { role: { type: 'string', enum: ['user', 'assistant'] }, content: { type: 'string' } },
+      required: ['role', 'content'],
+      additionalProperties: false,
+    },
+  }
+  return {
+    type: 'object',
+    properties: {
+      context: { type: 'string' },
+      pairs: {
+        type: 'array',
+        items: { type: 'object', properties: pairProperties, required: Object.keys(pairProperties), additionalProperties: false },
+      },
+      ...(extras ? { conversation } : {}),
+    },
+    required: extras ? ['context', 'pairs', 'conversation'] : ['context', 'pairs'],
+    additionalProperties: false,
+  }
+}
+
+function chunkPrompt(passage: string, overview: Overview, extras: boolean): string {
+  const about = overview.summary ? `"${overview.title}" — ${overview.summary}` : `"${overview.title}"`
+  return `You are building a fine-tuning dataset that teaches a language model the knowledge contained in a document.
+
+The document: ${about}
+
+Below is one passage from that document. Based ONLY on this passage, return:
+
+context: one or two sentences that place this passage within the whole document (which part it is and what it covers), so a search engine can find it later. Do not repeat the passage.
+
+pairs: up to 6 instruction-response pairs.
 - Mix the types: factual questions, "explain" requests, and short summaries of a specific idea.
 - Every instruction must make sense on its own, without the passage. Never refer to "the passage", "the text", "the document" or "this section" — name the actual subject instead.
-- Every response must be accurate and complete, and use only information from the passage. Answer directly, in full sentences.
+- Every output must be accurate and complete, and use only information from the passage. Answer directly, in full sentences.
+- quote: copy, word for word, the sentence or sentences from the passage that the output is based on. Do not change, shorten or fix a single word.${
+    extras
+      ? `
+- variants: two differently worded instructions that ask for exactly the same thing.
+- rejected: a plausible-sounding but flawed answer to the instruction: subtly wrong, incomplete, or containing a claim the passage does not support.`
+      : ''
+  }
 - No duplicate or near-duplicate pairs.
-- Write in the same language as the passage.
-- Skip boilerplate such as tables of contents, reference lists, page headers and copyright notices. If the passage has little real content, return fewer pairs or an empty list.
+- Skip boilerplate such as tables of contents, reference lists, page headers and copyright notices. If the passage has little real content, return fewer pairs or an empty list.${
+    extras
+      ? `
+
+conversation: a natural conversation of 4 to 6 messages between a curious user and an assistant about this passage. Start with the user and alternate. Follow-up questions should build on earlier answers, and the assistant must only state facts from the passage.`
+      : ''
+  }
+
+Write everything in the same language as the passage.
 
 Passage:
 ${passage}`
 }
 
-async function generatePairs(client: Anthropic, model: string, passage: string) {
-  const parsed = (await askForJson(client, model, pairsPrompt(passage), PAIRS_SCHEMA)) as { pairs?: { instruction: string; output: string }[] }
-  return (parsed.pairs ?? [])
-    .map((p) => ({ instruction: p.instruction.trim(), output: p.output.trim() }))
-    .filter((p) => p.instruction && p.output)
+const REVIEW_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    reviews: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          index: { type: 'integer' },
+          accurate: { type: 'boolean' },
+          standalone: { type: 'boolean' },
+          score: { type: 'integer' },
+          issue: { type: 'string' },
+        },
+        required: ['index', 'accurate', 'standalone', 'score', 'issue'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['reviews'],
+  additionalProperties: false,
 }
 
-export async function generateAiData(
-  { apiKey, model: modelName, source, text }: AiDataInput,
-  onProgress: (done: number, total: number) => void
-): Promise<AiDataResult> {
-  const client = createClient(apiKey)
+function reviewPrompt(passage: string, pairs: DraftPair[]): string {
+  return `You are checking a fine-tuning dataset for quality. Below is a passage and a numbered list of question-answer pairs that were written from it.
 
-  const chunks: Chunk[] = chunkText(text).map((t, i) => ({ source, chunk: i + 1, text: t, approx_tokens: approxTokens(t) }))
-  const pairsByChunk: TrainingPair[][] = []
+For every pair, return:
+- index: the pair's number
+- accurate: true only if every claim in the answer is supported by the passage
+- standalone: true if the question makes sense to someone who has not seen the passage
+- score: 1 to 5 for how useful the pair is as training data (5 = excellent)
+- issue: a few words on the main problem, or an empty string
+
+Be strict: a single unsupported claim makes accurate false.
+
+Passage:
+${passage}
+
+Pairs:
+${pairs.map((p, i) => `${i}. Q: ${p.instruction}\n   A: ${p.output}`).join('\n')}`
+}
+
+type DraftPair = { instruction: string; output: string; quote: string; variants: string[]; rejected: string }
+type Review = { index: number; accurate: boolean; standalone: boolean; score: number; issue: string }
+type ChunkReply = {
+  context?: string
+  pairs?: { instruction?: string; output?: string; quote?: string; variants?: string[]; rejected?: string }[]
+  conversation?: Message[]
+}
+type ChunkOutcome = {
+  context: string
+  pairs: DraftPair[]
+  conversation: Message[] | null
+  unverified: number
+  failedReview: number
+  reviewFailed: boolean
+}
+
+export async function generateAiData({ client, model, source, text, options }: AiDataInput, hooks: Hooks): Promise<AiDataResult> {
+  const texts = chunkText(text)
+  hooks.onProgress('Reading the document…', 0, texts.length)
+  const overview = await getOverview(client, model, source, text)
+
+  const outcomes: ChunkOutcome[] = []
   let firstError: unknown
   let next = 0
   let done = 0
-  let stopped = false
+  let failedHard = false
+  let stoppedByUser = false
 
   const worker = async () => {
-    while (!stopped && next < chunks.length) {
-      const { chunk, text: passage } = chunks[next++]
+    while (!failedHard && next < texts.length) {
+      if (hooks.shouldStop()) {
+        stoppedByUser = true
+        return
+      }
+      const index = next++
       try {
-        const pairs = await generatePairs(client, modelName, passage)
-        pairsByChunk[chunk - 1] = pairs.map((p) => ({ ...p, source, chunk }))
+        outcomes[index] = await processChunk(client, model, texts[index], overview, options)
       } catch (err) {
         firstError ??= err
-        if (isRequestLevelError(err)) stopped = true
+        // Request-level errors (bad key, no credit) would fail every remaining chunk the same way
+        if (isRequestLevelError(err)) failedHard = true
       }
-      onProgress(++done, chunks.length)
+      hooks.onProgress(`Generating training data… ${++done} of ${texts.length} chunks done`, done, texts.length)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, texts.length) }, worker))
+
+  const chunks: Chunk[] = texts.map((t, i) => {
+    const context = outcomes[i]?.context ?? ''
+    return { source, chunk: i + 1, context, text: t, search_text: context ? `${context}\n\n${t}` : t, approx_tokens: approxTokens(t) }
+  })
+
+  const dropped = { unverified: 0, review: 0, duplicates: 0 }
+  const seen = new Set<string>()
+  const pairs: Pair[] = []
+  const conversations: Conversation[] = []
+  outcomes.forEach((outcome, i) => {
+    dropped.unverified += outcome.unverified
+    dropped.review += outcome.failedReview
+    outcome.pairs.forEach((p, n) => {
+      const key = `${normalizeText(p.instruction)}\n${normalizeText(p.output)}`
+      if (seen.has(key)) {
+        dropped.duplicates++
+        return
+      }
+      seen.add(key)
+      pairs.push({ id: `${source}#${i + 1}.${n + 1}`, source, chunk: i + 1, ...p })
+    })
+    if (outcome.conversation) conversations.push({ source, chunk: i + 1, messages: outcome.conversation })
+  })
+
+  if (pairs.length === 0) {
+    if (stoppedByUser) throw new StoppedError()
+    if (firstError) throw firstError
+    throw new Error('No usable training pairs came out of this document: every pair failed the quote check or the double-check.')
+  }
+
+  const skipped = texts.map((_, i) => i + 1).filter((n) => !outcomes[n - 1])
+  const unreviewed = outcomes.filter((o) => o.reviewFailed).length
+  const stats: AiDataStats = {
+    source,
+    title: overview.title,
+    language: overview.language,
+    model,
+    created_at: new Date().toISOString(),
+    options: { review: options.review, extras: options.extras },
+    chunks: texts.length,
+    pairs: pairs.length,
+    rows: { training: alpacaRows(pairs).length, preferences: preferenceRows(pairs).length, conversations: conversations.length },
+    dropped,
+    approx_source_tokens: approxTokens(text),
+    approx_dataset_tokens: datasetTokens(pairs),
+    skipped_chunks: skipped,
+    unreviewed_chunks: unreviewed,
+  }
+
+  const warnings: string[] = []
+  if (stoppedByUser) warnings.push(`Stopped early: ${texts.length - skipped.length} of ${texts.length} chunks were processed.`)
+  else if (skipped.length) {
+    warnings.push(`${skipped.length} of ${texts.length} chunks couldn't be processed, so their training data is missing. ${describeClaudeError(firstError)}`)
+  }
+  if (unreviewed) warnings.push(`${unreviewed} chunk${unreviewed === 1 ? '' : 's'} couldn't be double-checked, so their pairs only passed the quote check.`)
+
+  return { overview, chunks, pairs, conversations, stats, ...(warnings.length ? { warning: warnings.join(' ') } : {}) }
+}
+
+async function getOverview(client: Anthropic, model: string, source: string, text: string): Promise<Overview> {
+  try {
+    const reply = (await askForJson(client, model, overviewPrompt(text), OVERVIEW_SCHEMA)) as Partial<Overview>
+    const language = (reply.language ?? '').trim().toLowerCase()
+    return { title: reply.title?.trim() || source, language: /^[a-z]{2}$/.test(language) ? language : '', summary: reply.summary?.trim() ?? '' }
+  } catch (err) {
+    // Only the title, language and summary depend on this, so carry on without them unless every request would fail
+    if (isRequestLevelError(err)) throw err
+    return { title: source, language: '', summary: '' }
+  }
+}
+
+async function processChunk(client: Anthropic, model: string, passage: string, overview: Overview, options: AiDataOptions): Promise<ChunkOutcome> {
+  const reply = (await askForJson(client, model, chunkPrompt(passage, overview, options.extras), chunkSchema(options.extras))) as ChunkReply
+  const candidates = (reply.pairs ?? []).map(cleanPair).filter((p) => p.instruction && p.output)
+  const verified = candidates.filter((p) => quoteFound(p.quote, passage))
+
+  let kept = verified
+  let reviewFailed = false
+  if (options.review && verified.length > 0) {
+    try {
+      const reviews = await reviewPairs(client, model, passage, verified)
+      kept = verified.filter((_, i) => passesReview(reviews.get(i)))
+    } catch (err) {
+      // These pairs are already paid for and passed the quote check, so keep them unless every request would fail
+      if (isRequestLevelError(err)) throw err
+      reviewFailed = true
     }
   }
 
-  onProgress(0, chunks.length)
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, worker))
-
-  const pairs = pairsByChunk.flat()
-  if (pairs.length === 0) {
-    throw firstError ?? new Error('No training pairs could be generated from this document.')
+  return {
+    context: (reply.context ?? '').trim(),
+    pairs: kept,
+    conversation: validConversation(reply.conversation),
+    unverified: candidates.length - verified.length,
+    failedReview: verified.length - kept.length,
+    reviewFailed,
   }
-
-  const stats: AiDataStats = {
-    source,
-    model: modelName,
-    created_at: new Date().toISOString(),
-    chunks: chunks.length,
-    pairs: pairs.length,
-    approx_source_tokens: approxTokens(text),
-    approx_dataset_tokens: datasetTokens(pairs),
-    skipped_chunks: chunks.filter((c) => !pairsByChunk[c.chunk - 1]).map((c) => c.chunk),
-  }
-
-  const result: AiDataResult = { chunks, pairs, stats }
-  if (stats.skipped_chunks.length > 0) {
-    result.warning = `${stats.skipped_chunks.length} of ${chunks.length} chunks couldn't be processed, so their training data is missing. ${describeClaudeError(firstError)}`
-  }
-  return result
 }
 
-// Alpaca format, plus source and chunk so every pair can be traced back to its document
-export const toAlpaca = (p: TrainingPair) => ({ instruction: p.instruction, input: '', output: p.output, source: p.source, chunk: p.chunk })
+async function reviewPairs(client: Anthropic, model: string, passage: string, pairs: DraftPair[]): Promise<Map<number, Review>> {
+  const reply = (await askForJson(client, model, reviewPrompt(passage, pairs), REVIEW_SCHEMA)) as { reviews?: Review[] }
+  return new Map((reply.reviews ?? []).map((r) => [r.index, r]))
+}
 
-// Chat format stays minimal — {"messages": [...]} is the exact shape OpenAI's fine-tuning expects
-export const toChat = (p: TrainingPair) => ({
-  messages: [
-    { role: 'user', content: p.instruction },
-    { role: 'assistant', content: p.output },
-  ],
-})
+// A pair the reviewer skipped is kept: it has already passed the quote check
+function passesReview(review: Review | undefined): boolean {
+  return !review || (review.accurate && review.standalone && review.score >= MIN_REVIEW_SCORE)
+}
 
-export const jsonl = (rows: unknown[]) => rows.map((row) => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : '')
+function cleanPair(p: NonNullable<ChunkReply['pairs']>[number]): DraftPair {
+  const instruction = (p.instruction ?? '').trim()
+  const output = (p.output ?? '').trim()
+  const rejected = (p.rejected ?? '').trim()
+  const variants = [...new Set((p.variants ?? []).map((v) => v.trim()))].filter((v) => v && normalizeText(v) !== normalizeText(instruction))
+  return {
+    instruction,
+    output,
+    quote: (p.quote ?? '').trim(),
+    variants,
+    rejected: normalizeText(rejected) === normalizeText(output) ? '' : rejected,
+  }
+}
+
+// Training needs a conversation that starts with the user, alternates, and ends with an answer
+function validConversation(messages: Message[] | undefined): Message[] | null {
+  const turns = (messages ?? []).map((m) => ({ role: m.role, content: m.content.trim() })).filter((m) => m.content)
+  while (turns.length && turns[turns.length - 1].role !== 'assistant') turns.pop()
+  const alternates = turns.every((m, i) => m.role === (i % 2 === 0 ? 'user' : 'assistant'))
+  return turns.length >= 2 && alternates ? turns : null
+}
 
 export function aiDataFiles(result: AiDataResult): Record<string, string> {
+  const { overview, pairs, conversations, chunks, stats } = result
+  const preferences = preferenceRows(pairs)
+  const configs: DatasetConfig[] = [
+    { name: 'alpaca', train: 'alpaca.jsonl', rows: stats.rows.training },
+    { name: 'chat', train: 'chat.jsonl', rows: stats.rows.training },
+    ...(preferences.length ? [{ name: 'preferences', train: 'preferences.jsonl', rows: preferences.length }] : []),
+    ...(conversations.length ? [{ name: 'conversations', train: 'conversations.jsonl', rows: conversations.length }] : []),
+    { name: 'chunks', train: 'chunks.jsonl', rows: chunks.length },
+    { name: 'pairs', train: 'pairs.jsonl', rows: pairs.length },
+  ]
+
   return {
-    'alpaca.jsonl': jsonl(result.pairs.map(toAlpaca)),
-    'chat.jsonl': jsonl(result.pairs.map(toChat)),
-    'chunks.jsonl': jsonl(result.chunks),
-    'stats.json': JSON.stringify(result.stats, null, 2),
+    'pairs.jsonl': jsonl(pairs),
+    'alpaca.jsonl': jsonl(alpacaRows(pairs)),
+    'chat.jsonl': jsonl(chatRows(pairs)),
+    ...(preferences.length ? { 'preferences.jsonl': jsonl(preferences) } : {}),
+    ...(conversations.length ? { 'conversations.jsonl': jsonl(conversationRows(conversations)) } : {}),
+    'chunks.jsonl': jsonl(chunks),
+    'stats.json': JSON.stringify(stats, null, 2),
+    'README.md': datasetCard({
+      title: overview.title,
+      summary: overview.summary,
+      languages: overview.language ? [overview.language] : [],
+      sources: [{ source: stats.source, pairs: pairs.length }],
+      models: [stats.model],
+      createdAt: stats.created_at,
+      reviewed: stats.options.review,
+      configs,
+    }),
   }
 }
